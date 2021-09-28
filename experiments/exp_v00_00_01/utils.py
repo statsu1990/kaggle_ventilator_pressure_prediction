@@ -4,6 +4,7 @@ import random
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+from pandas.core.window.rolling import Window
 from sklearn import model_selection
 from sklearn.preprocessing import RobustScaler
 
@@ -45,6 +46,7 @@ class Feature:
         #ft["x_u_in"] = np.log(df["u_in"] + 1)
         ft["x_u_in"] = df["u_in"]
         ft['x_u_in_cumsum'] = (df['u_in']).groupby(df['breath_id']).cumsum()
+        #ft['x_u_in-ave'] = df["u_in"] - df.groupby('breath_id')['u_in'].rolling(window=3, min_periods=1, center=True).mean().fillna(0).reset_index(level=0, drop=True)
 
         ft["x_u_out"] = df["u_out"]
 
@@ -59,6 +61,7 @@ class Feature:
         #ft["x_C20"] = (df["C"] == 20) * 1
         #ft["x_C50"] = (df["C"] == 50) * 1
         #ft["x_C"] = df["C"].map({10: -1, 20: 0, 50: 1})
+
 
         return ft
 
