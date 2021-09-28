@@ -42,10 +42,23 @@ class Feature:
     def transform(self, df):
         ft = pd.DataFrame([], index=df.index)
 
-        ft["x_u_in"] = np.log(df["u_in"] + 1)
-        ft["x_R"] = (df["R"] - 5) / 45
-        ft["x_C"] = (df["R"] - 10) / 40
+        #ft["x_u_in"] = np.log(df["u_in"] + 1)
+        ft["x_u_in"] = df["u_in"]
+        ft['x_u_in_cumsum'] = (df['u_in']).groupby(df['breath_id']).cumsum()
+
         ft["x_u_out"] = df["u_out"]
+
+        ft["x_R"] = (df["R"] - 5) / 45
+        #ft["x_R5"] = (df["R"] == 5) * 1
+        #ft["x_R20"] = (df["R"] == 20) * 1
+        #ft["x_R50"] = (df["R"] == 50) * 1
+        #ft["x_R"] = df["R"].map({5: -1, 20: 0, 50: 1})
+
+        ft["x_C"] = (df["C"] - 10) / 40
+        #ft["x_C10"] = (df["C"] == 10) * 1
+        #ft["x_C20"] = (df["C"] == 20) * 1
+        #ft["x_C50"] = (df["C"] == 50) * 1
+        #ft["x_C"] = df["C"].map({10: -1, 20: 0, 50: 1})
 
         return ft
 
@@ -203,8 +216,16 @@ class DNN(nn.Module):
     def __init__(self, n_feat, n_channel, dropout, n_rc_layer):
         super(DNN, self).__init__()
 
-        self.rc = nn.GRU(n_feat, n_channel, batch_first=True, bidirectional=True, num_layers=n_rc_layer, dropout=dropout)
-        self.head = nn.Linear(n_channel * 2, 1)
+        self.mlp = nn.Sequential(
+            nn.Linear(n_feat, 64),
+            nn.ReLU(),
+        )
+        self.rc = nn.GRU(64, n_channel, batch_first=True, bidirectional=True, num_layers=n_rc_layer, dropout=dropout)
+        self.head = nn.Sequential(
+            nn.Linear(n_channel * 2, 64), 
+            nn.ReLU(),
+            nn.Linear(64, 1),
+        )
 
     def forward(self, x):
         """
@@ -214,9 +235,34 @@ class DNN(nn.Module):
             y: (batch, seq, 1)
         """
         h = x
+        h = self.mlp(h)
         h = self.rc(h)[0]
         h = self.head(h)
         return h
+
+
+class IdentityScaler:
+    def __init__(self):
+        pass
+
+    def fit(self, x, y=None):
+        return self
+
+    def transform(self, x):
+        if type(x) is pd.DataFrame:
+            return x.values.copy()
+        elif type(x) is pd.Series:
+            return x.values.copy()
+        else:
+            return x.copy()
+
+    def inverse_transform(self, x):
+        if type(x) is pd.DataFrame:
+            return x.values.copy()
+        elif type(x) is pd.Series:
+            return x.values.copy()
+        else:
+            return x.copy()
 
 
 class VentilatorLoss(nn.Module):
@@ -470,6 +516,61 @@ class Predictor:
         return preds
 
 
+class Evaluation:
+    def __init__(self, oof_df):
+        self.oof_df = oof_df
+        self.uniq_folds = sorted(self.oof_df["fold"].unique().tolist())
+        return
+
+    def _get_fold_result(self, df, fold):
+        return df[df["fold"] == fold].copy()
+
+    def _get_inspiratory_phase(self, df):
+        return df[df["u_out"] == 0].copy()
+
+    def _mae(self, df):
+        y_true = df["pressure"]
+        y_pred = df["pred"]
+        mae = np.abs(y_true - y_pred).mean()
+        return mae
+
+    def calc_scores(self):
+        rslts = {}
+        for fold in self.uniq_folds:
+            rslt = {}
+
+            df = self._get_fold_result(self.oof_df, fold)
+            df = self._get_inspiratory_phase(df)
+
+            rslt["mae"] = self._mae(df)
+
+            rslts[fold] = rslt
+
+        keys = rslts[list(rslts.keys())[0]].keys()
+        av_rslt = {k: np.average([v[k] for v in rslts.values()]) for k in keys}
+        rslts["av"] = av_rslt
+
+        return rslts
+
+    def calc_breath_mae(self):
+        df = self._get_inspiratory_phase(self.oof_df)
+        df["error"] = np.abs(df["pressure"] - df["pred"])
+
+        breath_mae = df[["breath_id", "error"]].groupby("breath_id").mean()
+        return breath_mae
+
+    def plot_breath(self, breath_id):
+        bdf = self.oof_df[self.oof_df["breath_id"]==breath_id].copy()
+        bdf = bdf.sort_values("id")
+
+        bdf = bdf[["u_in", "pressure", "pred", "R", "C"]]
+        bdf[["u_in", "pressure", "pred"]].plot()
+        R = bdf["R"].iloc[0]
+        C = bdf["C"].iloc[0]
+        plt.title(f"breath_id {breath_id} (R{R},C{C})")
+        plt.show()
+
+
 def test1():
     tr_file = "input/ventilator-pressure-prediction/train.csv"
     tr_df = pd.read_csv(tr_file)
@@ -514,6 +615,25 @@ def test2():
     tr_df.to_csv("test_tr_df.csv")
 
 
+def test3():
+    oof_df = pd.read_csv("experiments/exp_v00_00_00/oof.csv")
+    ev = Evaluation(oof_df)
+    score = ev.calc_scores()
+    print(score)
+
+    breath_mae = ev.calc_breath_mae()
+    breath_mae = breath_mae.sort_values("error", ascending=False)
+    print(breath_mae)
+
+    ev.plot_breath(breath_mae.index[0])
+    ev.plot_breath(breath_mae.index[1])
+    ev.plot_breath(breath_mae.index[2])
+
+
+
+
+
 if __name__ == "__main__":
     #test1()
-    test2()
+    #test2()
+    test3()
