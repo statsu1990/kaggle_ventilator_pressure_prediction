@@ -100,7 +100,6 @@ class EnsembleModel:
 class Model:
     def __init__(
         self, 
-        scaling_prms,
         dnn_prms, 
         tr_prms, 
         nn_prms, 
@@ -109,6 +108,7 @@ class Model:
         train_batch_size=128,
         pred_batch_size=128,
         dev="cuda",
+        scaling_prms=None,
         ):
         """
         Args:
@@ -120,7 +120,7 @@ class Model:
         self.seq_len = seq_len
         self.dev = dev
 
-        self.x_scalers = [RobustScaler() for i in range(scaling_prms["n_scaler"])]
+        self.x_scaler = RobustScaler()
         self.y_scaler = RobustScaler()
 
         self.train_batch_size = train_batch_size
@@ -139,25 +139,24 @@ class Model:
         Args:
             tr_x (pd.DataFrame): columns=x feature
         """
+        tr_x = self.extract_use_seq_len(tr_x)
+        tr_y = self.extract_use_seq_len(tr_y)
+        vl_x = self.extract_use_seq_len(vl_x)
+        vl_y = self.extract_use_seq_len(vl_y)
+
         # group
         tr_group = self.make_group(tr_x)
         vl_group = self.make_group(vl_x)
 
         # fit scaler
-        # x
-        if len(self.x_scalers) > 0:
-            tmp_x = self.extract_use_seq_len(tr_x)
-            for i, scl in enumerate(self.x_scalers):
-                scl.fit(tmp_x[:, i: i+1])
-        # y
-        tmp_y = self.extract_use_seq_len(tr_y)
-        self.y_scaler.fit(tmp_y)
+        self.x_scaler.fit(tr_x)
+        self.y_scaler.fit(tr_y)
 
         # scaling
-        tr_x = self.scaling(tr_x, self.x_scalers)
-        tr_y = self.scaling(tr_y, [self.y_scaler])
-        vl_x = self.scaling(vl_x, self.x_scalers)
-        vl_y = self.scaling(vl_y, [self.y_scaler])
+        tr_x = self.scaling(tr_x, self.x_scaler)
+        tr_y = self.scaling(tr_y, self.y_scaler)
+        vl_x = self.scaling(vl_x, self.x_scaler)
+        vl_y = self.scaling(vl_y, self.y_scaler)
 
         # to seq
         # (sample, seq, feat)
@@ -167,8 +166,17 @@ class Model:
         vl_y = self.to_sequence(vl_y)
 
         # fit nn
-        self.gnrnb.fit(tr_x[:, :self.use_seq_len, 0], tr_y[:, :self.use_seq_len], tr_group)
-        score = self.gnrnb.score(vl_x[:, :self.use_seq_len, 0], vl_y[:, :self.use_seq_len], vl_group)
+        self.gnrnb.fit(tr_x[:, :, 0], tr_y, tr_group)
+        score = self.gnrnb.score(vl_x[:, :, 0], vl_y, vl_group)
+
+        # add nn feature, y_nn (sample, n_neighbors, seq, 1), x_nn (sample, n_neighbors, seq)
+        #tr_y_nn, tr_x_nn = self.gnrnb.kneighbors(tr_x[:, :self.use_seq_len, 0], tr_group, return_x=True)
+        #vl_y_nn, vl_x_nn = self.gnrnb.kneighbors(vl_x[:, :self.use_seq_len, 0], vl_group, return_x=True)
+
+        #n_neighbors = tr_y_nn.shape[1]
+        #for inb in range(n_neighbors):
+        #    tr_x[f"x_nn{inb}_y"] = np.pad(tr_y_nn[:, inb, :, 0], [(0, 0), (0, self.seq_len - self.use_seq_len)], "constant")
+            
 
         """
         # fit dnn
@@ -191,17 +199,19 @@ class Model:
         Args:
             x (pd.DataFrame): columns=x feature
         """
+        x = self.extract_use_seq_len(x)
+
         # group
         group = self.make_group(x)
 
         # scaling
-        x = self.scaling(x, self.x_scalers)
+        x = self.scaling(x, self.x_scaler)
 
         # to seq
         x = self.to_sequence(x)
 
         # nbnr predicting
-        pred = self.gnrnb.predict(x[:, :self.use_seq_len, 0], group)
+        pred = self.gnrnb.predict(x[:, :, 0], group)
 
         """
         # dnn predicting
@@ -224,36 +234,47 @@ class Model:
 
         return pred
 
-    def scaling(self, x, scalers):
+    def extract_use_seq_len(self, x):
+        """
+        Args:
+            x (pd.DataFrame): columns=x feature
+        """
+        seq = self.to_sequence(x, self.seq_len)
+        seq = seq[:, :self.use_seq_len, :]
+        ex_x = seq.reshape([-1, seq.shape[2]])
+        ex_x = pd.DataFrame(ex_x, columns=x.columns)
+        return ex_x
+
+    def scaling(self, x, scaler):
         """
         Args:
             x (pd.DataFrame): 
         """
-        x = x.copy()
-        if len(scalers) > 0:
-            for i, scl in enumerate(scalers):
-                x.iloc[:, i: i+1] = scl.transform(x.iloc[:, i: i+1])
-        return x
+        sc_x = scaler.transform(x)
+        sc_x = pd.DataFrame(sc_x, index=x.index, columns=x.columns)
+        return sc_x
 
-    def to_sequence(self, x):
+    def to_sequence(self, x, seq_len=None):
         """
         Args:
             x (pd.DataFrame): columns=feature
         Returns:
             ndarray: (breath_id, seq, feat)
         """
-        seq = x.values.reshape([-1, self.seq_len, x.shape[1]]).copy()
+        if seq_len is not None:
+            seq = x.values.reshape([-1, seq_len, x.shape[1]]).copy()
+        else:
+            seq = x.values.reshape([-1, self.use_seq_len, x.shape[1]]).copy()
         return seq
 
-    def extract_use_seq_len(self, x):
+    def to_continuous(self, x):
         """
         Args:
-            x (pd.DataFrame): columns=x feature
+            x: (sample, seq, feat)
+        Returns:
+            x: (sample * seq, feat)
         """
-        seq = self.to_sequence(x)
-        seq = seq[:, :self.use_seq_len, :]
-        ex_x = seq.reshape([-1, seq.shape[2]])
-        return ex_x
+        return x.reshape(-1, x.shape[-1])
 
     def make_group(self, x):
         group = x["x_R"].astype(str) + "+" + x["x_C"].astype(str)
@@ -626,7 +647,6 @@ class VentilatorNearestNeighbors:
         else:
             return y_neighbor
 
-
     def score(self, x, y):
         pred = self.predict(x)
         score = np.abs(pred - y).mean()
@@ -675,6 +695,37 @@ class VentilatorGroupNearestNeighbors:
             pred[is_in_gr] = gr_pred
 
         return pred
+
+    def kneighbors(self, x, group, return_x=False):
+        """
+        Returns:
+            y_neighbor: (sample, n_neighbors, seq, 1)
+            x_neighbor: (sample, n_neighbors, seq)
+        """
+        tmp_vnrnb = self.vnrnbs[self.vnrnbs.keys()[0]]
+        n_neighbors = tmp_vnrnb.nrnb.n_neighbors - tmp_vnrnb.remove_nearest
+
+        y_neighbor = np.zeros((x.shape[0], n_neighbors, x.shape[1], 1))
+        if return_x:
+            x_neighbor = np.zeros((x.shape[0], n_neighbors, x.shape[1]))
+
+        for gr_idx in self.group_idxs:
+            is_in_gr = (group == gr_idx)
+            gr_x = x[is_in_gr]
+            
+            if return_x:
+                gr_y_neighbor, gr_x_neighbor = self.vnrnbs[gr_idx].kneighbor(gr_x, return_x)
+                y_neighbor[is_in_gr] = gr_y_neighbor
+                x_neighbor[is_in_gr] = gr_x_neighbor
+            else:
+                gr_y_neighbor = self.vnrnbs[gr_idx].kneighbor(gr_x, return_x)
+                y_neighbor[is_in_gr] = gr_y_neighbor
+
+        if return_x:
+            return y_neighbor, x_neighbor
+        else:
+            return y_neighbor
+
 
     def score(self, x, y, group):
         pred = self.predict(x, group)
