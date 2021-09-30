@@ -115,18 +115,22 @@ class Model:
             nn_prms (dict): nearest neighbor
         """
         self.use_seq_len = use_seq_len
+
+        dnn_prms = dnn_prms.copy()
+        dnn_prms["n_feat"] = dnn_prms["n_feat"] + (nn_prms["n_neighbors"] - 1) * 2
         self.dnn = DNN(**dnn_prms)
         self.tr_prms = tr_prms
         self.seq_len = seq_len
         self.dev = dev
 
         self.x_scaler = RobustScaler()
+        self.x_nn_scaler = RobustScaler()
         self.y_scaler = RobustScaler()
 
         self.train_batch_size = train_batch_size
         self.pred_batch_size = pred_batch_size
 
-        self.gnrnb = VentilatorGroupNearestNeighbors(nn_prms, remove_nearest=False)
+        self.gnrnb = VentilatorGroupNearestNeighbors(nn_prms, remove_nearest=True)
 
         return
 
@@ -169,16 +173,34 @@ class Model:
         self.gnrnb.fit(tr_x[:, :, 0], tr_y, tr_group)
         score = self.gnrnb.score(vl_x[:, :, 0], vl_y, vl_group)
 
-        # add nn feature, y_nn (sample, n_neighbors, seq, 1), x_nn (sample, n_neighbors, seq)
-        #tr_y_nn, tr_x_nn = self.gnrnb.kneighbors(tr_x[:, :self.use_seq_len, 0], tr_group, return_x=True)
-        #vl_y_nn, vl_x_nn = self.gnrnb.kneighbors(vl_x[:, :self.use_seq_len, 0], vl_group, return_x=True)
+        # calc nn feature
+        # y_nn (sample, n_neighbors, seq, 1), x_nn (sample, n_neighbors, seq)
+        tr_y_nn, tr_x_nn = self.gnrnb.kneighbors(tr_x[:, :, 0], tr_group, return_x=True)
+        vl_y_nn, vl_x_nn = self.gnrnb.kneighbors(vl_x[:, :, 0], vl_group, return_x=True)
+        # (sample, seq, feat)
+        tr_x_nnft = np.concatenate([tr_y_nn[:,:,:,0].transpose(0,2,1), tr_x_nn.transpose(0,2,1)], axis=2)
+        vl_x_nnft = np.concatenate([vl_y_nn[:,:,:,0].transpose(0,2,1), vl_x_nn.transpose(0,2,1)], axis=2)
 
-        #n_neighbors = tr_y_nn.shape[1]
-        #for inb in range(n_neighbors):
-        #    tr_x[f"x_nn{inb}_y"] = np.pad(tr_y_nn[:, inb, :, 0], [(0, 0), (0, self.seq_len - self.use_seq_len)], "constant")
-            
+        # continuous
+        tr_x_nnft = self.to_continuous(tr_x_nnft)
+        vl_x_nnft = self.to_continuous(vl_x_nnft)
 
-        """
+        # fit scaler
+        self.x_nn_scaler.fit(tr_x_nnft)
+
+        # scaling
+        tr_x_nnft = self.x_nn_scaler.transform(tr_x_nnft)
+        vl_x_nnft = self.x_nn_scaler.transform(vl_x_nnft)
+
+        # to seq
+        # (sample, seq, feat)
+        tr_x_nnft = self.to_sequence(tr_x_nnft)
+        vl_x_nnft = self.to_sequence(vl_x_nnft)
+
+        # add nn feat
+        tr_x = np.concatenate([tr_x, tr_x_nnft], axis=2)
+        vl_x = np.concatenate([vl_x, vl_x_nnft], axis=2)
+
         # fit dnn
         # dataset
         tr_ds = VentilatorDataset(tr_x, tr_y, self.use_seq_len)
@@ -190,7 +212,6 @@ class Model:
         self.dnn = self.dnn.to(self.dev)
         trainer = Trainer(dev=self.dev, **self.tr_prms)
         score = trainer.run(self.dnn, tr_dl, vl_dl)
-        """
 
         return score
 
@@ -211,16 +232,27 @@ class Model:
         x = self.to_sequence(x)
 
         # nbnr predicting
-        pred = self.gnrnb.predict(x[:, :, 0], group)
+        y_nn, x_nn = self.gnrnb.kneighbors(x[:, :, 0], group, return_x=True)
+        x_nnft = np.concatenate([y_nn[:,:,:,0].transpose(0,2,1), x_nn.transpose(0,2,1)], axis=2)
 
-        """
+        # continuous
+        x_nnft = self.to_continuous(x_nnft)
+
+        # scaling
+        x_nnft = self.x_nn_scaler.transform(x_nnft)
+
+        # to seq
+        x_nnft = self.to_sequence(x_nnft)
+
+        # add nn feat
+        x = np.concatenate([x, x_nnft], axis=2)
+
         # dnn predicting
         ds = VentilatorDataset(x, None, self.use_seq_len)
         dl = get_dataloader(ds, self.pred_batch_size, shuffle=False, drop_last=False)
 
         predictor = Predictor(self.dev, do_print=True)
         pred = predictor.run(self.dnn, dl) # (breath_id, seq, 1)
-        """
 
         # 0 pad in out of seq
         pred = pred[:, :, 0] # (breath_id, seq)
@@ -262,9 +294,15 @@ class Model:
             ndarray: (breath_id, seq, feat)
         """
         if seq_len is not None:
-            seq = x.values.reshape([-1, seq_len, x.shape[1]]).copy()
+            if hasattr(x, "values"):
+                seq = x.values.reshape([-1, seq_len, x.shape[1]]).copy()
+            else:
+                seq = x.reshape([-1, seq_len, x.shape[1]]).copy()
         else:
-            seq = x.values.reshape([-1, self.use_seq_len, x.shape[1]]).copy()
+            if hasattr(x, "values"):
+                seq = x.values.reshape([-1, self.use_seq_len, x.shape[1]]).copy()
+            else:
+                seq = x.reshape([-1, self.use_seq_len, x.shape[1]]).copy()
         return seq
 
     def to_continuous(self, x):
@@ -702,7 +740,7 @@ class VentilatorGroupNearestNeighbors:
             y_neighbor: (sample, n_neighbors, seq, 1)
             x_neighbor: (sample, n_neighbors, seq)
         """
-        tmp_vnrnb = self.vnrnbs[self.vnrnbs.keys()[0]]
+        tmp_vnrnb = self.vnrnbs[list(self.vnrnbs.keys())[0]]
         n_neighbors = tmp_vnrnb.nrnb.n_neighbors - tmp_vnrnb.remove_nearest
 
         y_neighbor = np.zeros((x.shape[0], n_neighbors, x.shape[1], 1))
@@ -714,18 +752,17 @@ class VentilatorGroupNearestNeighbors:
             gr_x = x[is_in_gr]
             
             if return_x:
-                gr_y_neighbor, gr_x_neighbor = self.vnrnbs[gr_idx].kneighbor(gr_x, return_x)
+                gr_y_neighbor, gr_x_neighbor = self.vnrnbs[gr_idx].kneighbors(gr_x, return_x)
                 y_neighbor[is_in_gr] = gr_y_neighbor
                 x_neighbor[is_in_gr] = gr_x_neighbor
             else:
-                gr_y_neighbor = self.vnrnbs[gr_idx].kneighbor(gr_x, return_x)
+                gr_y_neighbor = self.vnrnbs[gr_idx].kneighbors(gr_x, return_x)
                 y_neighbor[is_in_gr] = gr_y_neighbor
 
         if return_x:
             return y_neighbor, x_neighbor
         else:
             return y_neighbor
-
 
     def score(self, x, y, group):
         pred = self.predict(x, group)
@@ -812,7 +849,7 @@ def test1():
             maximize_score=False,
         ), 
         "nn_prms": dict(
-            n_neighbors=1,
+            n_neighbors=2,
         ),
         "seq_len": 80,
         "use_seq_len": 32, 
